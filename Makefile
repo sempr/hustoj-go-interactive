@@ -25,3 +25,4 @@ run: build
 
 clean:
 	rm -f $(CONTROLLER) $(JUDGE) $(PLAYER)
+
