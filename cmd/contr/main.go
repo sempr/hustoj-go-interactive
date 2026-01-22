@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,17 +14,11 @@ import (
 	"time"
 )
 
-// Result 表示 judge 向 controller 汇报的结果
-type Result struct {
-	Status string `json:"status"`
-	Reason string `json:"reason,omitempty"`
-}
+const (
+	nobodyUID = 65534
+	nobodyGID = 65534
+)
 
-// 最低权限 nobody
-const nobodyUID = 65534
-const nobodyGID = 65534
-
-// SandboxConfig 保存命令和 rootfs 路径
 type SandboxConfig struct {
 	JudgeRootfs  string
 	JudgeCmd     string
@@ -33,25 +27,57 @@ type SandboxConfig struct {
 	TimeoutMS    int
 }
 
-// helper
-func must(err error) {
-	if err != nil {
-		panic(err)
-		log.Fatal(err)
-	}
-}
-
-// CgroupStats holds resource usage statistics
 type CgroupStats struct {
 	MemoryPeakBytes uint64
 	CPUUsageUser    uint64
 	CPUUsageSystem  uint64
 }
 
-// createCgroup creates a cgroup v2 directory and sets limits
+type CgroupSetup struct {
+	JudgePath  string
+	PlayerPath string
+}
+
+type PipeSetup struct {
+	JudgeToPlayerRead  *os.File
+	JudgeToPlayerWrite *os.File
+	PlayerToJudgeRead  *os.File
+	PlayerToJudgeWrite *os.File
+	ReportRead         *os.File
+	ReportWrite        *os.File
+}
+
+type MonitoringState struct {
+	Done         chan bool
+	MaxJudgeMem  uint64
+	MaxPlayerMem uint64
+}
+
+func must(err error) {
+	if err != nil {
+		slog.Error("fatal error", "error", err)
+		panic(err)
+	}
+}
+
+func parseArgs() SandboxConfig {
+	cfg := SandboxConfig{}
+	flag.StringVar(&cfg.JudgeRootfs, "judge-rootfs", "", "judge rootfs path")
+	flag.StringVar(&cfg.JudgeCmd, "judge-cmd", "/bin/judge", "judge command path")
+	flag.StringVar(&cfg.PlayerRootfs, "player-rootfs", "", "player rootfs path")
+	flag.StringVar(&cfg.PlayerCmd, "player-cmd", "/bin/player", "player command path")
+	flag.IntVar(&cfg.TimeoutMS, "timeout", 5000, "timeout in milliseconds")
+	flag.Parse()
+
+	if cfg.JudgeRootfs == "" || cfg.PlayerRootfs == "" {
+		slog.Error("must provide rootfs paths")
+		os.Exit(1)
+	}
+	return cfg
+}
+
 func createCgroup(name string, memoryLimitMB, cpuMax string) string {
 	cgroupPath := filepath.Join("/sys/fs/cgroup", name)
-
 	must(os.MkdirAll(cgroupPath, 0755))
 
 	if memoryLimitMB != "" {
@@ -67,60 +93,197 @@ func createCgroup(name string, memoryLimitMB, cpuMax string) string {
 	return cgroupPath
 }
 
-// addProcessToCgroup adds a process to a cgroup
+func deleteCgroup(cgroupPath string) {
+	_ = os.RemoveAll(cgroupPath)
+}
+
+func setupCgroups() CgroupSetup {
+	judgeCgroup := createCgroup("guess_judge", "100", "100000 1000000")
+	playerCgroup := createCgroup("guess_player", "100", "100000 1000000")
+
+	slog.Info("cgroup setup", "judge", judgeCgroup, "player", playerCgroup)
+
+	return CgroupSetup{
+		JudgePath:  judgeCgroup,
+		PlayerPath: playerCgroup,
+	}
+}
+
+func setupPipes() PipeSetup {
+	jToP_R, jToP_W, _ := os.Pipe()
+	pToJ_R, pToJ_W, _ := os.Pipe()
+	reportR, reportW, _ := os.Pipe()
+
+	return PipeSetup{
+		JudgeToPlayerRead:  jToP_R,
+		JudgeToPlayerWrite: jToP_W,
+		PlayerToJudgeRead:  pToJ_R,
+		PlayerToJudgeWrite: pToJ_W,
+		ReportRead:         reportR,
+		ReportWrite:        reportW,
+	}
+}
+
 func addProcessToCgroup(cgroupPath string, pid int) {
 	procsFile := filepath.Join(cgroupPath, "cgroup.procs")
 	err := os.WriteFile(procsFile, []byte(strconv.Itoa(pid)), 0644)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[CGROUP] Failed to add PID %d to cgroup %s: %v\n", pid, cgroupPath, err)
+		slog.Error("failed to add process to cgroup", "pid", pid, "cgroup", cgroupPath, "error", err)
 	} else {
-		fmt.Fprintf(os.Stderr, "[CGROUP] Successfully added PID %d to cgroup %s\n", pid, cgroupPath)
+		slog.Info("added process to cgroup", "pid", pid, "cgroup", cgroupPath)
 	}
 }
 
-// getCgroupStats reads resource usage from cgroup
+func spawnSandbox(cmdPath, rootfs, cgroupPath string, stdin, stdout *os.File, extraFiles []*os.File) *exec.Cmd {
+	selfPath, err := os.Executable()
+	must(err)
+
+	cmd := exec.Command(selfPath)
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = os.Stderr
+	if len(extraFiles) > 0 {
+		cmd.ExtraFiles = extraFiles
+	}
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUSER,
+		UidMappings: []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
+			{ContainerID: nobodyUID, HostID: nobodyUID, Size: 1},
+		},
+		GidMappings: []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
+			{ContainerID: nobodyGID, HostID: nobodyGID, Size: 1},
+		},
+	}
+
+	cmd.Env = append(os.Environ(),
+		"SANDBOX_INIT=1",
+		"SANDBOX_ROOTFS="+rootfs,
+		"SANDBOX_TARGET="+cmdPath,
+	)
+
+	slog.Info("starting sandbox setup", "rootfs", rootfs, "target", cmdPath)
+
+	err = cmd.Start()
+	must(err)
+
+	slog.Info("process started", "pid", cmd.Process.Pid)
+
+	if cgroupPath != "" {
+		slog.Info("adding process to cgroup", "pid", cmd.Process.Pid, "cgroup", cgroupPath)
+		addProcessToCgroup(cgroupPath, cmd.Process.Pid)
+		if procs, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.procs")); err == nil {
+			slog.Debug("cgroup.procs after add", "procs", string(procs))
+		}
+	}
+
+	return cmd
+}
+
+func startMonitoring(judgeCgroup, playerCgroup string) MonitoringState {
+	done := make(chan bool)
+	state := MonitoringState{
+		Done:         done,
+		MaxJudgeMem:  0,
+		MaxPlayerMem: 0,
+	}
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				slog.Info("monitoring stopped", "maxJudgeMem", state.MaxJudgeMem, "maxPlayerMem", state.MaxPlayerMem)
+				return
+			case <-ticker.C:
+				if data, err := os.ReadFile(filepath.Join(judgeCgroup, "memory.current")); err == nil {
+					var val uint64
+					fmt.Sscanf(string(data), "%d", &val)
+					if val > state.MaxJudgeMem {
+						state.MaxJudgeMem = val
+						slog.Debug("judge memory current (new peak)", "bytes", val)
+					}
+				}
+				if data, err := os.ReadFile(filepath.Join(playerCgroup, "memory.current")); err == nil {
+					var val uint64
+					fmt.Sscanf(string(data), "%d", &val)
+					if val > state.MaxPlayerMem {
+						state.MaxPlayerMem = val
+						slog.Debug("player memory current (new peak)", "bytes", val)
+					}
+				}
+			}
+		}
+	}()
+
+	return state
+}
+
+func waitForResult(reportR *os.File, timeout time.Duration) string {
+	resultCh := make(chan string, 1)
+
+	go func() {
+		reader := bufio.NewReader(reportR)
+		line, _ := reader.ReadString('\n')
+		resultCh <- strings.TrimSpace(line)
+	}()
+
+	select {
+	case res := <-resultCh:
+		return res
+	case <-time.After(timeout):
+		return "timeout"
+	}
+}
+
+func readMemoryStat(cgroupPath string) uint64 {
+	if data, err := os.ReadFile(filepath.Join(cgroupPath, "memory.stat")); err == nil {
+		lines := strings.Split(string(data), "\n")
+		var maxVal uint64
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) == 2 {
+				if val, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+					switch fields[0] {
+					case "file", "anon", "rss", "shmem":
+						if val > maxVal {
+							maxVal = val
+						}
+					}
+				}
+			}
+		}
+		return maxVal
+	}
+	return 0
+}
+
 func getCgroupStats(cgroupPath string) CgroupStats {
 	stats := CgroupStats{}
 
 	if data, err := os.ReadFile(filepath.Join(cgroupPath, "memory.peak")); err == nil {
 		peakStr := strings.TrimSpace(string(data))
-		fmt.Fprintf(os.Stderr, "[CGROUP] memory.peak: %s\n", peakStr)
+		slog.Debug("memory.peak", "value", peakStr)
 		fmt.Sscanf(peakStr, "%d", &stats.MemoryPeakBytes)
 	} else {
-		fmt.Fprintf(os.Stderr, "[CGROUP] Failed to read memory.peak: %v\n", err)
+		slog.Error("failed to read memory.peak", "cgroup", cgroupPath, "error", err)
 	}
 
 	if data, err := os.ReadFile(filepath.Join(cgroupPath, "memory.current")); err == nil {
-		currentStr := strings.TrimSpace(string(data))
-		fmt.Fprintf(os.Stderr, "[CGROUP] memory.current: %s\n", currentStr)
+		slog.Debug("memory.current", "value", strings.TrimSpace(string(data)))
 	}
 
-	if data, err := os.ReadFile(filepath.Join(cgroupPath, "memory.stat")); err == nil {
-		lines := strings.Split(string(data), "\n")
-		for _, line := range lines {
-			fields := strings.Fields(line)
-			if len(fields) == 2 {
-				if val, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
-					if fields[0] == "file" && val > stats.MemoryPeakBytes {
-						stats.MemoryPeakBytes = val
-					}
-					if fields[0] == "anon" && val > stats.MemoryPeakBytes {
-						stats.MemoryPeakBytes = val
-					}
-					if fields[0] == "rss" && val > stats.MemoryPeakBytes {
-						stats.MemoryPeakBytes = val
-					}
-					if fields[0] == "shmem" && val > stats.MemoryPeakBytes {
-						stats.MemoryPeakBytes = val
-					}
-				}
-			}
-		}
-		fmt.Fprintf(os.Stderr, "[CGROUP] memory.stat total from rss/anon/file/shmem: %d bytes\n", stats.MemoryPeakBytes)
+	statMem := readMemoryStat(cgroupPath)
+	if statMem > stats.MemoryPeakBytes {
+		stats.MemoryPeakBytes = statMem
 	}
+	slog.Debug("memory.stat total", "bytes", stats.MemoryPeakBytes)
 
 	if data, err := os.ReadFile(filepath.Join(cgroupPath, "cpu.stat")); err == nil {
-		fmt.Fprintf(os.Stderr, "[CGROUP] cpu.stat: %s\n", string(data))
+		slog.Debug("cpu.stat", "content", string(data))
 		lines := strings.Split(string(data), "\n")
 		for _, line := range lines {
 			fields := strings.Fields(line)
@@ -138,303 +301,156 @@ func getCgroupStats(cgroupPath string) CgroupStats {
 	return stats
 }
 
-// deleteCgroup removes a cgroup directory
-func deleteCgroup(cgroupPath string) {
-	_ = os.RemoveAll(cgroupPath)
+func printStats(name string, stats CgroupStats) {
+	fmt.Printf("\n[CGROUP STATS] %s:\n", name)
+	fmt.Printf("  Memory Peak: %.2f MB\n", float64(stats.MemoryPeakBytes)/1024/1024)
+	fmt.Printf("  CPU Usage: user=%.2f ms, system=%.2f ms\n", float64(stats.CPUUsageUser)/1000, float64(stats.CPUUsageSystem)/1000)
 }
 
-// 解析 CLI 参数
-func parseArgs() SandboxConfig {
-	cfg := SandboxConfig{}
-	flag.StringVar(&cfg.JudgeRootfs, "judge-rootfs", "", "judge rootfs path")
-	flag.StringVar(&cfg.JudgeCmd, "judge-cmd", "/bin/judge", "judge command path")
-	flag.StringVar(&cfg.PlayerRootfs, "player-rootfs", "", "player rootfs path")
-	flag.StringVar(&cfg.PlayerCmd, "player-cmd", "/bin/player", "player command path")
-	flag.IntVar(&cfg.TimeoutMS, "timeout", 5000, "timeout in milliseconds")
-	flag.Parse()
+func collectAndPrintStats(judgeCgroup, playerCgroup string, state MonitoringState) {
+	judgeStats := getCgroupStats(judgeCgroup)
+	playerStats := getCgroupStats(playerCgroup)
 
-	if cfg.JudgeRootfs == "" || cfg.PlayerRootfs == "" {
-		log.Fatal("must provide rootfs paths")
+	if state.MaxJudgeMem > judgeStats.MemoryPeakBytes {
+		judgeStats.MemoryPeakBytes = state.MaxJudgeMem
 	}
-	return cfg
+	if state.MaxPlayerMem > playerStats.MemoryPeakBytes {
+		playerStats.MemoryPeakBytes = state.MaxPlayerMem
+	}
+
+	printStats("Judge", judgeStats)
+	printStats("Player", playerStats)
+
+	if judgeProcs, err := os.ReadFile(filepath.Join(judgeCgroup, "cgroup.procs")); err == nil {
+		slog.Debug("judge cgroup.procs", "content", string(judgeProcs))
+	}
+	if playerProcs, err := os.ReadFile(filepath.Join(playerCgroup, "cgroup.procs")); err == nil {
+		slog.Debug("player cgroup.procs", "content", string(playerProcs))
+	}
+
+	files, _ := os.ReadDir(judgeCgroup)
+	fileNames := make([]string, len(files))
+	for i, f := range files {
+		fileNames[i] = f.Name()
+	}
+	slog.Debug("judge cgroup files", "files", fileNames)
 }
 
-// 在子进程中执行 pivot_root + mount /proc + setuid
 func childInit(rootfs string) {
-	fmt.Fprintf(os.Stderr, "[SANDBOX] === childInit STARTED ===\n")
-	fmt.Fprintf(os.Stderr, "[SANDBOX] PID: %d, PPID: %d\n", os.Getpid(), os.Getppid())
-	fmt.Fprintf(os.Stderr, "[SANDBOX] UID: %d, GID: %d\n", os.Getuid(), os.Getgid())
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Rootfs: %s\n", rootfs)
+	slog.Info("childInit started", "pid", os.Getpid(), "ppid", os.Getppid(), "uid", os.Getuid(), "gid", os.Getgid(), "rootfs", rootfs)
 
-	// mount namespace 私有化
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Creating private mount namespace...\n")
+	slog.Debug("creating private mount namespace")
 	must(syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""))
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Private mount namespace created\n")
 
-	// bind mount rootfs
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Bind mounting rootfs: %s\n", rootfs)
+	slog.Debug("bind mounting rootfs", "rootfs", rootfs)
 	must(syscall.Mount(rootfs, rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""))
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Rootfs bind mounted\n")
 
 	os.Mkdir(rootfs+"/proc", 0755)
-	// 创建 old_root 目录用于 pivot_root
+
 	oldRoot := rootfs + "/old_root"
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Creating old_root directory: %s\n", oldRoot)
+	slog.Debug("creating old_root directory", "path", oldRoot)
 	must(os.Mkdir(oldRoot, 0755))
-	fmt.Fprintf(os.Stderr, "[SANDBOX] old_root directory created\n")
 
-	// pivot_root
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Executing pivot_root...\n")
+	slog.Debug("executing pivot_root")
 	must(syscall.PivotRoot(rootfs, oldRoot))
-	fmt.Fprintf(os.Stderr, "[SANDBOX] pivot_root completed\n")
 
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Changing directory to /...\n")
+	slog.Debug("changing directory to /")
 	must(os.Chdir("/"))
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Current directory changed to /\n")
 
-	// 卸载 old_root
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Unmounting /old_root...\n")
+	slog.Debug("unmounting /old_root")
 	must(syscall.Unmount("/old_root", syscall.MNT_DETACH))
 	_ = os.RemoveAll("/old_root")
-	fmt.Fprintf(os.Stderr, "[SANDBOX] old_root unmounted and removed\n")
 
-	// 挂载 /proc (使用 bind mount，必须在切换到 nobody 之前执行)
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Mounting /proc via bind...\n")
+	slog.Debug("mounting /proc via bind")
 	err := syscall.Mount("/proc", "/proc", "", syscall.MS_BIND|syscall.MS_REC|syscall.MS_NOSUID|syscall.MS_NOEXEC|syscall.MS_NODEV, "")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[SANDBOX] Failed to mount /proc: %v\n", err)
+		slog.Error("failed to mount /proc", "error", err)
 	} else {
-		fmt.Fprintf(os.Stderr, "[SANDBOX] /proc mounted successfully\n")
+		slog.Debug("/proc mounted successfully")
 	}
 
-	// 切换到 nobody (在 user namespace 中已经是非特权)
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Switching to nobody (UID=%d, GID=%d)...\n", nobodyUID, nobodyGID)
+	slog.Debug("switching to nobody", "uid", nobodyUID, "gid", nobodyGID)
 	must(syscall.Setgid(nobodyGID))
 	must(syscall.Setuid(nobodyUID))
-	fmt.Fprintf(os.Stderr, "[SANDBOX] UID/GID switched to nobody\n")
-	fmt.Fprintf(os.Stderr, "[SANDBOX] Final UID: %d, GID: %d\n", os.Getuid(), os.Getgid())
 
-	fmt.Fprintf(os.Stderr, "[SANDBOX] === childInit COMPLETED ===\n")
+	slog.Info("childInit completed")
 }
 
-// 根据 SANDBOX_ENV 判断是否是 sandbox 子进程
 func maybeSandboxInit() {
-	fmt.Fprintf(os.Stderr, "[CHECK] Checking SANDBOX_INIT: %s\n", os.Getenv("SANDBOX_INIT"))
+	sandboxInit := os.Getenv("SANDBOX_INIT")
+	slog.Debug("checking SANDBOX_INIT", "value", sandboxInit)
 
-	if os.Getenv("SANDBOX_INIT") != "1" {
-		fmt.Fprintf(os.Stderr, "[CHECK] Not in sandbox mode, returning to controller\n")
+	if sandboxInit != "1" {
+		slog.Info("not in sandbox mode, returning to controller")
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "[CHECK] Detected sandbox environment!\n")
+	slog.Info("detected sandbox environment")
 	rootfs := os.Getenv("SANDBOX_ROOTFS")
 	target := os.Getenv("SANDBOX_TARGET")
-	fmt.Fprintf(os.Stderr, "[CHECK] SANDBOX_ROOTFS=%s\n", rootfs)
-	fmt.Fprintf(os.Stderr, "[CHECK] SANDBOX_TARGET=%s\n", target)
+	slog.Info("sandbox env vars", "rootfs", rootfs, "target", target)
 
 	if rootfs == "" {
+		slog.Error("SANDBOX_ROOTFS missing")
 		panic("SANDBOX_ROOTFS missing")
 	}
 
 	if target == "" {
+		slog.Error("SANDBOX_TARGET missing")
 		panic("SANDBOX_TARGET missing")
 	}
 
-	fmt.Fprintf(os.Stderr, "[CHECK] About to call childInit...\n")
+	slog.Debug("about to call childInit")
 	childInit(rootfs)
-	fmt.Fprintf(os.Stderr, "[CHECK] childInit returned, sandbox setup complete\n")
 
-	fmt.Fprintf(os.Stderr, "[CHECK] Preparing to exec into target: %s\n", target)
-
-	// Clean environment before exec
 	os.Unsetenv("SANDBOX_INIT")
 	os.Unsetenv("SANDBOX_ROOTFS")
 	os.Unsetenv("SANDBOX_TARGET")
 
-	fmt.Fprintf(os.Stderr, "[CHECK] Environment cleaned, calling syscall.Exec...\n")
-
-	// syscall.Exec replaces this process with the target binary
-	// Process keeps all the sandbox setup (namespaces, mounts, UID/GID)
-	// but runs the target binary's code instead
+	slog.Debug("calling syscall.Exec")
 	must(syscall.Exec(target, []string{target}, os.Environ()))
-
-	// This line never reached because process is replaced
 	panic("syscall.Exec returned unexpectedly!")
 }
 
-// spawnSandbox 创建一个命令在独立 namespace 下运行
-func spawnSandbox(cmdPath, rootfs string, cgroupPath string, stdin, stdout *os.File, extraFiles []*os.File) (*exec.Cmd, error) {
-	// Get path to this controller binary (we'll exec ourselves first)
-	selfPath, err := os.Executable()
-	must(err)
+func runGame(cfg SandboxConfig, cgroupSetup CgroupSetup, pipeSetup PipeSetup) string {
+	playerCmd := spawnSandbox(cfg.PlayerCmd, cfg.PlayerRootfs, cgroupSetup.PlayerPath, pipeSetup.JudgeToPlayerRead, pipeSetup.PlayerToJudgeWrite, nil)
+	judgeCmd := spawnSandbox(cfg.JudgeCmd, cfg.JudgeRootfs, cgroupSetup.JudgePath, pipeSetup.PlayerToJudgeRead, pipeSetup.JudgeToPlayerWrite, []*os.File{pipeSetup.ReportWrite})
 
-	// Start THIS binary with sandbox setup mode
-	cmd := exec.Command(selfPath)
-	cmd.Stdin = stdin
-	cmd.Stdout = stdout
-	cmd.Stderr = os.Stderr
-	if len(extraFiles) > 0 {
-		cmd.ExtraFiles = extraFiles
-	}
+	monitoring := startMonitoring(cgroupSetup.JudgePath, cgroupSetup.PlayerPath)
+	result := waitForResult(pipeSetup.ReportRead, time.Duration(cfg.TimeoutMS)*time.Millisecond)
 
-	// Create namespaces
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUSER,
-		UidMappings: []syscall.SysProcIDMap{
-			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
-			{ContainerID: nobodyUID, HostID: nobodyUID, Size: 1},
-		},
-		GidMappings: []syscall.SysProcIDMap{
-			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
-			{ContainerID: nobodyGID, HostID: nobodyGID, Size: 1},
-		},
-	}
-
-	// Set environment to trigger sandbox setup mode
-	cmd.Env = append(os.Environ(),
-		"SANDBOX_INIT=1",
-		"SANDBOX_ROOTFS="+rootfs,
-		"SANDBOX_TARGET="+cmdPath,
-	)
-	fmt.Fprintf(os.Stderr, "[SPAWN] Starting sandbox setup with controller binary\n")
-	fmt.Fprintf(os.Stderr, "[SPAWN] Environment: SANDBOX_INIT=1, ROOTFS=%s, TARGET=%s\n", rootfs, rootfs+cmdPath)
-
-	err = cmd.Start()
-	fmt.Fprintf(os.Stderr, "[SPAWN] Process started, PID: %d\n", cmd.Process.Pid)
-
-	if cgroupPath != "" {
-		fmt.Fprintf(os.Stderr, "[SPAWN] Adding PID %d to cgroup %s\n", cmd.Process.Pid, cgroupPath)
-		addProcessToCgroup(cgroupPath, cmd.Process.Pid)
-
-		// Verify the process was added
-		if procs, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.procs")); err == nil {
-			fmt.Fprintf(os.Stderr, "[SPAWN] cgroup.procs after add: %s", string(procs))
-		}
-	}
-
-	return cmd, err
-}
-
-func main() {
-	fmt.Fprintf(os.Stderr, "[MAIN] Starting program, PID: %d, PPID: %d\n", os.Getpid(), os.Getppid())
-	fmt.Fprintf(os.Stderr, "[MAIN] Current working dir: %s\n", func() string { wd, _ := os.Getwd(); return wd }())
-
-	maybeSandboxInit()
-
-	cfg := parseArgs()
-	fmt.Fprintf(os.Stderr, "[MAIN] Parsed config, continuing as controller\n")
-
-	// Create cgroups
-	judgeCgroup := createCgroup("guess_judge", "100", "100000 1000000")
-	playerCgroup := createCgroup("guess_player", "100", "100000 1000000")
-	defer deleteCgroup(judgeCgroup)
-	defer deleteCgroup(playerCgroup)
-
-	fmt.Fprintf(os.Stderr, "[CGROUP] Judge cgroup: %s\n", judgeCgroup)
-	fmt.Fprintf(os.Stderr, "[CGROUP] Player cgroup: %s\n", playerCgroup)
-
-	// Judge -> Player pipes
-	jToP_R, jToP_W, _ := os.Pipe()
-	pToJ_R, pToJ_W, _ := os.Pipe()
-
-	// Judge -> Controller (fd=3)
-	reportR, reportW, _ := os.Pipe()
-
-	// spawn player
-	playerCmd, err := spawnSandbox(cfg.PlayerCmd, cfg.PlayerRootfs, playerCgroup, jToP_R, pToJ_W, nil)
-	must(err)
-	// spawn judge
-	judgeCmd, err := spawnSandbox(cfg.JudgeCmd, cfg.JudgeRootfs, judgeCgroup, pToJ_R, jToP_W, []*os.File{reportW})
-	must(err)
-
-	timeout := time.After(time.Duration(cfg.TimeoutMS) * time.Millisecond)
-	resultCh := make(chan string, 1)
-
-	// Monitor memory usage periodically
-	done := make(chan bool)
-	var maxJudgeMem, maxPlayerMem uint64
-	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				fmt.Fprintf(os.Stderr, "[MONITOR] Sampling stopped. maxJudgeMem=%d, maxPlayerMem=%d\n", maxJudgeMem, maxPlayerMem)
-				return
-			case <-ticker.C:
-				if data, err := os.ReadFile(filepath.Join(judgeCgroup, "memory.current")); err == nil {
-					var val uint64
-					fmt.Sscanf(string(data), "%d", &val)
-					if val > maxJudgeMem {
-						maxJudgeMem = val
-						fmt.Fprintf(os.Stderr, "[MONITOR] Judge memory.current: %d (new peak)\n", val)
-					}
-				}
-				if data, err := os.ReadFile(filepath.Join(playerCgroup, "memory.current")); err == nil {
-					var val uint64
-					fmt.Sscanf(string(data), "%d", &val)
-					if val > maxPlayerMem {
-						maxPlayerMem = val
-						fmt.Fprintf(os.Stderr, "[MONITOR] Player memory.current: %d (new peak)\n", val)
-					}
-				}
-			}
-		}
-	}()
-
-	// 读取 judge 的 fd=3
-	go func() {
-		reader := bufio.NewReader(reportR)
-		line, _ := reader.ReadString('\n')
-		resultCh <- strings.TrimSpace(line)
-	}()
-
-	select {
-	case res := <-resultCh:
-		fmt.Println("[controller] result:", res)
-	case <-timeout:
+	if result == "timeout" {
 		fmt.Println("[controller] timeout")
-		_ = judgeCmd.Process.Kill()
-		_ = playerCmd.Process.Kill()
+		judgeCmd.Process.Kill()
+		playerCmd.Process.Kill()
+	} else {
+		fmt.Println("[controller] result:", result)
 	}
 
 	judgeCmd.Wait()
 	playerCmd.Wait()
-	close(done)
+	close(monitoring.Done)
 	time.Sleep(100 * time.Millisecond)
 
-	// Print cgroup statistics
-	judgeStats := getCgroupStats(judgeCgroup)
-	playerStats := getCgroupStats(playerCgroup)
+	collectAndPrintStats(cgroupSetup.JudgePath, cgroupSetup.PlayerPath, monitoring)
 
-	if maxJudgeMem > judgeStats.MemoryPeakBytes {
-		judgeStats.MemoryPeakBytes = maxJudgeMem
-	}
-	if maxPlayerMem > playerStats.MemoryPeakBytes {
-		playerStats.MemoryPeakBytes = maxPlayerMem
-	}
+	return result
+}
 
-	fmt.Printf("\n[CGROUP STATS] Judge:\n")
-	fmt.Printf("  Memory Peak: %.2f MB\n", float64(judgeStats.MemoryPeakBytes)/1024/1024)
-	fmt.Printf("  CPU Usage: user=%.2f ms, system=%.2f ms\n", float64(judgeStats.CPUUsageUser)/1000, float64(judgeStats.CPUUsageSystem)/1000)
+func main() {
+	wd, _ := os.Getwd()
+	slog.Info("starting program", "pid", os.Getpid(), "ppid", os.Getppid(), "cwd", wd)
 
-	fmt.Printf("\n[CGROUP STATS] Player:\n")
-	fmt.Printf("  Memory Peak: %.2f MB\n", float64(playerStats.MemoryPeakBytes)/1024/1024)
-	fmt.Printf("  CPU Usage: user=%.2f ms, system=%.2f ms\n", float64(playerStats.CPUUsageUser)/1000, float64(playerStats.CPUUsageSystem)/1000)
+	maybeSandboxInit()
 
-	// Debug: check cgroup.procs
-	if judgeProcs, err := os.ReadFile(filepath.Join(judgeCgroup, "cgroup.procs")); err == nil {
-		fmt.Fprintf(os.Stderr, "[CGROUP] Judge cgroup.procs: %s", string(judgeProcs))
-	}
-	if playerProcs, err := os.ReadFile(filepath.Join(playerCgroup, "cgroup.procs")); err == nil {
-		fmt.Fprintf(os.Stderr, "[CGROUP] Player cgroup.procs: %s", string(playerProcs))
-	}
+	cfg := parseArgs()
+	slog.Info("parsed config, continuing as controller")
 
-	// Debug: list cgroup files
-	files, _ := os.ReadDir(judgeCgroup)
-	fmt.Fprintf(os.Stderr, "[CGROUP] Judge cgroup files: ")
-	for _, f := range files {
-		fmt.Fprintf(os.Stderr, "%s ", f.Name())
-	}
-	fmt.Fprintf(os.Stderr, "\n")
+	cgroupSetup := setupCgroups()
+	defer deleteCgroup(cgroupSetup.JudgePath)
+	defer deleteCgroup(cgroupSetup.PlayerPath)
+
+	pipeSetup := setupPipes()
+
+	runGame(cfg, cgroupSetup, pipeSetup)
 }
